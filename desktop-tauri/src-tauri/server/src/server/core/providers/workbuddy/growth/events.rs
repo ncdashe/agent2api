@@ -155,7 +155,7 @@ pub fn build_event(account: &GrowthAccount, kind: &str, object: &ObjectId, index
             "reportDelay": 0, "isCustomModel": true, "id": object_id,
             "name": name, "requestId": rid, "conversationId": cid, "userId": uid,
         }),
-        "expert" | "lighthouse" => json!({
+        "expert" | "lighthouse" | "valorant" => json!({
             "eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
             "mode": "CLOUD", "id": object_id, "name": if name.is_empty() { object_id } else { &name },
             "expertTitle": name, "type": meta.get("category").and_then(Value::as_str).unwrap_or(""),
