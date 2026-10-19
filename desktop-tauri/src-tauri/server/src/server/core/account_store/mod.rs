@@ -96,6 +96,10 @@
 //!                开头的 API Key 添加、公开形态（只给尾号）
 //!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
 //!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
+//!   workbuddy_import.rs  WorkBuddy 官方桌面客户端登录态导入（国内版 / 国际版
+//!                两组文件）：读文件 → 必要时解密 → 落库
+//!   workbuddy_atrest.rs  5.8.x `$wbEncrypted` 字段级落盘加密的解密实现
+//!                （保护密钥来自环境变量或运行中客户端的内存；算法与实测见模块头）
 
 pub mod accio_accounts;
 pub mod antigravity_accounts;
@@ -127,6 +131,7 @@ pub mod store_order;
 pub mod store_util;
 pub mod store_view;
 pub mod trae_accounts;
+pub mod workbuddy_atrest;
 pub mod workbuddy_import;
 pub mod zcode_accounts;
 

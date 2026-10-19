@@ -129,15 +129,25 @@ bcrypt = "0.15"
 # （to_luma8 转灰度后 detect_grids），不新增图片解码栈。
 rqrr = "0.11"
 
-# AutoClaw 凭证解密的 DPAPI（providers/autoclaw/crypto.rs）。仅 Windows
+# AutoClaw 凭证解密的 DPAPI（providers/autoclaw/crypto.rs）与 WorkBuddy
+# 落盘加密的取键（core/account_store/workbuddy_atrest.rs）。仅 Windows
 # 目标生效；其它平台该适配器的「导入桌面端登录态」是桩实现。
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
+    "Win32_Foundation",
     "Win32_Security_Cryptography",
     # KukuAI 会话换发（providers/kuku/engine.rs）：LoadLibrary 引擎 DLL +
     # 枚举注册表卸载项定位客户端安装目录
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    # WorkBuddy 5.8.x 的 at-rest 保护密钥只在运行中的客户端进程内存里
+    # （见 core/account_store/workbuddy_atrest.rs 模块头）：
+    # ToolHelp 枚举进程（Process32FirstW/NextW）+ Debug 里的 ReadProcessMemory
+    # + Memory 里的 VirtualQueryEx 只读扫描目标内存；OpenProcess 在 Threading。
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
 ] }
 # Windows 服务形态（bin/service.rs）：`--service` 参数下把进程交给 SCM
 # （StartServiceCtrlDispatcherW + 控制事件回调 + 状态上报）。

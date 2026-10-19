@@ -9,6 +9,19 @@
 //! 因此本文件只做「定位文件 + 读出来」，落库全部复用 `add_account`
 //! （撞 id 保护、edition 解析、token 长度校验都在那边）。
 //!
+//! ── 5.8.3 起：字段被加密，先解再落 ──────────────────────────
+//! 新版客户端把 `accessToken` / `refreshToken` / 昵称 / 手机号这些**敏感字段**
+//! 换成了 `{"$wbEncrypted":1,"envelope":"…"}` 信封（AES-256-GCM，字段档）。
+//! 原样交给 `add_account` 会拿到对象而不是字符串 → 落库失败。所以本文件在
+//! 「读出来」与「落库」之间插一步：[`super::workbuddy_atrest::prepare_payload`]。
+//! 它做三件事：解析 JSON → 没有信封就原样返回（兼容旧版明文文件）→ 有信封就
+//! 取 at-rest 保护密钥并就地解开（密钥取法与算法见该模块的模块头）。
+//!
+//! 保护密钥**不在任何落盘文件里**（实测 42128 个文件 0 命中），只能从
+//! 运行中的官方客户端进程内存里取，或由用户填 `WORKBUDDY_AT_REST_SECRET_KEY`。
+//! 因此加密形态下要求「客户端正跑着且是同一个 Windows 用户」——
+//! 取不到时本函数返回 400 并说清这两条补救路径，而不是静默导入一个空壳账号。
+//!
 //! ── 两家两个文件前缀（按 provider 参数化，与 AutoClaw 的地区同款）──
 //!   `workbuddy`（国内版）      → `workbuddy-desktop.info`（实测 domain
 //!                                `www.workbuddy.cn`）
@@ -149,13 +162,13 @@ impl AccountStore {
                 path.display()
             ))
         })?;
-        let payload: Value = serde_json::from_str(&text).map_err(|error| {
-            AccountStoreError::bad_request(format!(
-                "登录态文件不是合法 JSON（{}）：{error}",
-                path.display()
-            ))
+        // 解析 + （5.8.3 起的）字段解密一次性做完：解密失败时错误文案里
+        // 已经带了「要么让客户端跑着、要么填 WORKBUDDY_AT_REST_SECRET_KEY」，
+        // 这里只补上文件名，方便对上排查的是哪一份。
+        let prepared = super::workbuddy_atrest::prepare_payload(&text).map_err(|error| {
+            AccountStoreError::bad_request(format!("{error}（登录态文件：{}）", path.display()))
         })?;
-        let account = self.add_account(&payload, name, Some(kind_id(if intl {
+        let account = self.add_account(&prepared.payload, name, Some(kind_id(if intl {
             ProviderKind::WorkBuddyIntl
         } else {
             ProviderKind::WorkBuddy
@@ -164,9 +177,15 @@ impl AccountStore {
             logging::log(
                 "[Accounts]",
                 &format!(
-                    "📥 已从官方客户端导入 {}账号（{}）",
+                    "📥 已从官方客户端导入 {}账号（{}；解密字段 {} 个，密钥来源 {}）",
                     if intl { "国际版" } else { "国内版" },
-                    path.display()
+                    path.display(),
+                    prepared.decrypted_fields,
+                    if prepared.key_source.is_empty() {
+                        "无需（明文文件）"
+                    } else {
+                        prepared.key_source.as_str()
+                    }
                 ),
             );
         }

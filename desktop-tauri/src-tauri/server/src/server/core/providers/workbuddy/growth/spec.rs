@@ -15,9 +15,9 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use super::{GrowthAccount, bill_call, chat_call};
+use super::{bill_call, chat_call, GrowthAccount};
 
 /// 一个任务的完成定义（映射表条目）。
 pub struct TaskSpec {
@@ -39,7 +39,15 @@ pub struct TaskSpec {
 
 impl TaskSpec {
     const fn new(kind: &'static str, target: i64, src: &'static str, needs_object: bool) -> Self {
-        Self { kind, target, src, needs_object, unforgeable: false, reason: "", mp: false }
+        Self {
+            kind,
+            target,
+            src,
+            needs_object,
+            unforgeable: false,
+            reason: "",
+            mp: false,
+        }
     }
 
     const fn unforgeable(reason: &'static str) -> Self {
@@ -82,7 +90,9 @@ pub fn spec_of(code: &str) -> Option<TaskSpec> {
         // web 域 web_element_click
         "Library_read" => TaskSpec::new("library", 1, "资料库介绍点击（web 域）", false),
         // ── 小程序成长任务（growth 域 mp 口径；accept/claim 需 mp 头）──
-        "Sequential_Tasks_1" => TaskSpec::new("minichat", 1, "小程序对话（无 activityId）", false).with_mp(),
+        "Sequential_Tasks_1" => {
+            TaskSpec::new("minichat", 1, "小程序对话（无 activityId）", false).with_mp()
+        }
         "Sequential_Tasks_2" => {
             TaskSpec::new("miniexpert", 1, "小程序选中专家对话", true).with_mp()
         }
@@ -93,9 +103,34 @@ pub fn spec_of(code: &str) -> Option<TaskSpec> {
         "Sequential_Tasks_5" => {
             TaskSpec::new("miniglmchat", 1, "小程序 GLM5.2 对话", false).with_mp()
         }
-        "school_season" => TaskSpec::new("schoolseason", 1, "校园日活动（mini chat+activityId）", false).with_mp(),
+        // ── 2026-10-19 线上实况新登记（用真账号巡检器实拉，见
+        //    `tools/growth-live-inspect.mjs` 与 docs/growth-new-activity.md）──
+        // 小程序对话 ×10（与 Sequential_Tasks_3 同判据，只是 target 更大）
+        "Sequential_Tasks_6" => TaskSpec::new("minichat", 10, "小程序对话 ×10", false).with_mp(),
+        // 「体验灵感功能」：task_desc 原文「在 PC 客户端内选择更多-灵感-选中模板使用」
+        // —— PC 侧判据，但任务的 accept/claim 走小程序口径（mp 头必需）
+        "Sequential_Tasks_7" => TaskSpec::new("playbook", 1, "PC 灵感案例 id", true).with_mp(),
+        // 「体验「无畏契约拼豆专家」」：task_desc 原文「即日起至11月15日，在专家页
+        // 搜索并召唤「无畏契约拼豆专家」，完成一次对话」→ 专家使用判据（kind=valorant，
+        // 与 expert 同事件形状），对象 id 由 `fetch_valorant_expert` 解析
+        "WorkBuddy_Valorant" => TaskSpec::new(
+            "valorant",
+            1,
+            "无畏契约拼豆专家 id（市场搜索，回落实测值）",
+            true,
+        ),
+        "school_season" => TaskSpec::new(
+            "schoolseason",
+            1,
+            "校园日活动（mini chat+activityId）",
+            false,
+        )
+        .with_mp(),
         // ── 不可伪造 ──
         "Expert_Philanthropy" => TaskSpec::unforgeable("真实捐款动作"),
+        // 「关注「腾讯 WorkBuddy」官方公众号」：task_desc 原文「关注…满 24 小时，
+        // 即可领取奖励」——进度由真实关注行为 + 时间决定，客户端侧无上报口
+        "wb_wechat_oa_subscribe_task" => TaskSpec::unforgeable("需真实关注公众号并满 24 小时"),
         _ => return None,
     };
     Some(spec)
@@ -154,15 +189,20 @@ pub async fn ids_for(
         "expert" => Ok(slice(fetch_market_experts(account, false, None).await)),
         "team" => Ok(slice(fetch_market_experts(account, true, None).await)),
         "lighthouse" => Ok(slice(fetch_lighthouse(account).await)),
+        "valorant" => Ok(slice(fetch_valorant(account).await)),
         "skill" => Ok(slice(fetch_skills(account).await)),
         "playbook" => Ok(slice(fetch_playbook_cases().await)),
         "skin" => Ok(slice(fetch_pe_theme(account).await)),
         "miniexpert" => Ok(slice(fetch_market_experts(account, false, None).await)),
         // 无载体类型：返回空 id 占位（events.rs 构造时不需要对象）
         "chat" | "glmchat" | "cat" | "automation" | "richmeow" | "buddy5" | "library"
-        | "buddyfirst" | "minichat" | "schoolseason" | "miniautomation" | "miniglmchat" => {
-            Ok((0..need).map(|_| ObjectId { id: String::new(), meta: Value::Null }).collect())
-        }
+        | "buddyfirst" | "minichat" | "schoolseason" | "miniautomation" | "miniglmchat" => Ok((0
+            ..need)
+            .map(|_| ObjectId {
+                id: String::new(),
+                meta: Value::Null,
+            })
+            .collect()),
         other => Err(format!("未知 kind：{other}")),
     }
 }
@@ -203,6 +243,9 @@ const DEFAULT_SKILL_IDS: &[(&str, &str)] = &[
     ("skill_2095322904487550976", "pdf"),
 ];
 const LIGHTHOUSE_FALLBACK: &[(&str, &str)] = &[("ex_2cvvUZQhDyeJ", "腾讯轻量云专家")];
+/// 「无畏契约拼豆专家」的实测 id（来源见 [`fetch_valorant`] 的注释）。
+const VALORANT_EXPERT: &str = "ex_xQHHD1u5Jkua";
+const VALORANT_EXPERT_NAME: &str = "无畏契约拼豆专家";
 const PE_THEME: &str = "theme-tkmw7j";
 const PE_THEME_NAME: &str = "和平精英激战金秋";
 /// COS 静态专家清单（团队专家市场列表很薄，COS 有全量 52 个 team）
@@ -243,25 +286,61 @@ async fn fetch_scenes(account: &GrowthAccount) -> Vec<ObjectId> {
     if out.is_empty() {
         out = DEFAULT_SCENES
             .iter()
-            .map(|(id, name)| ObjectId { id: id.to_string(), meta: json!({ "name": name }) })
+            .map(|(id, name)| ObjectId {
+                id: id.to_string(),
+                meta: json!({ "name": name }),
+            })
             .collect();
     }
     out
 }
 
 /// 专家市场清单（POST /v2/operation-platform/market/expert/list，最多 3 页）。
-/// `team_only` 只留 expert_type=team；`keyword` 关键词过滤。COS 静态清单补足。
+///
+/// ── 请求体为什么长这样（逐字照抄客户端，2026-10-20 实测复现）────
+/// 客户端 `CloudExpertRepo._fetchPublicMarketExperts` 与 `fetchMarketExpertPage`
+/// 两处的构造完全一致，字段是**固定四件套 + 可选过滤**：
+///   `{page, page_size, sort_by: sort_by ?? "reco_rank", sort_order: 默认 "desc"}`
+///   `keyword` 有值才带；`expert_type` / `categories` / `need_pay_assets` 同理。
+/// 实测三域（copilot.tencent.com / www.workbuddy.cn / www.codebuddy.cn）一律
+/// 200 + `code=0`，`data.experts` + `data.total_count`：
+///   裸分页 → total=22357、本页 50 条；
+///   `keyword=拼豆` → 4 条，第一条就是任务要的 `ex_xQHHD1u5Jkua`（无畏契约拼豆专家）；
+///   `expert_type=team` → total=2340。
+/// `sort_by` / `sort_order` **必须显式给**：早前只发 `{page,page_size}` 的探针
+/// 在部分请求里被上游回了 `{"code":17101,"msg":"invalid request body"}` ——
+/// 服务端默认值不可依赖，这里固定写死客户端同款默认值。
+///
+/// ── 响应取值 ────────────────────────────────────────────────
+/// 主键是 `data.experts`；同时容忍 `data.items` —— 客户端自己写的就是
+/// `data?.items ?? data?.experts ?? []`，跟着它写最稳。
+/// 分页终止：本页条数 < page_size 即停，不多发请求。
+///
+/// ── 兜底 ────────────────────────────────────────────────────
+/// 实时列表为空时由 COS 静态清单（`fetch_cos_experts`）与内置表补足，
+/// 保证任务对象 id 永远拿得到（判据见各自注释）。
 async fn fetch_market_experts(
     account: &GrowthAccount,
     team_only: bool,
     keyword: Option<&str>,
 ) -> Vec<ObjectId> {
+    const PAGE_SIZE: i64 = 50;
     let mut out: Vec<ObjectId> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for page in 1..=3 {
-        let mut body = json!({ "page": page, "page_size": 50 });
+        let mut body = json!({
+            "page": page,
+            "page_size": PAGE_SIZE,
+            "sort_by": "reco_rank",
+            "sort_order": "desc",
+        });
         if let Some(keyword) = keyword {
             body["keyword"] = Value::from(keyword);
+        }
+        // 团队专家交给服务端过滤（实测 total 22357 → 2340），省一次全量翻页；
+        // 客户端侧的同名判断仍保留，_value 供 COS 合并那一段继续用。
+        if team_only {
+            body["expert_type"] = Value::from("team");
         }
         let call = chat_call(
             account,
@@ -278,13 +357,14 @@ async fn fetch_market_experts(
         let experts = call
             .data()
             .get("experts")
+            .or_else(|| call.data().get("items"))
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
         if experts.is_empty() {
             break;
         }
-        let count = experts.len();
+        let count = experts.len() as i64;
         for expert in experts {
             let id = expert
                 .get("expert_id")
@@ -294,7 +374,10 @@ async fn fetch_market_experts(
             if id.is_empty() || seen.iter().any(|item| item == id) {
                 continue;
             }
-            let expert_type = expert.get("expert_type").and_then(Value::as_str).unwrap_or("agent");
+            let expert_type = expert
+                .get("expert_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
             if team_only && expert_type != "team" {
                 continue;
             }
@@ -319,7 +402,7 @@ async fn fetch_market_experts(
                 }),
             });
         }
-        if count < 50 {
+        if count < PAGE_SIZE {
             break;
         }
     }
@@ -327,7 +410,10 @@ async fn fetch_market_experts(
     if let Some(cos) = fetch_cos_experts().await {
         for expert in cos {
             let id = expert.get("id").and_then(Value::as_str).unwrap_or("");
-            let expert_type = expert.get("expertType").and_then(Value::as_str).unwrap_or("agent");
+            let expert_type = expert
+                .get("expertType")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
             if id.is_empty()
                 || (team_only && expert_type != "team")
                 || seen.iter().any(|item| item == id)
@@ -351,19 +437,21 @@ async fn fetch_market_experts(
         }
     }
     if out.is_empty() {
-        let fallback: &[&str] = if team_only { DEFAULT_TEAM_IDS } else { DEFAULT_EXPERT_IDS };
+        let fallback: &[&str] = if team_only {
+            DEFAULT_TEAM_IDS
+        } else {
+            DEFAULT_EXPERT_IDS
+        };
         out = fallback
             .iter()
-            .map(|id| {
-                ObjectId {
-                    id: (*id).to_string(),
-                    meta: json!({
-                        "name": "",
-                        "category": "",
-                        "expertType": if team_only { "team" } else { "agent" },
-                        "version": "",
-                    }),
-                }
+            .map(|id| ObjectId {
+                id: (*id).to_string(),
+                meta: json!({
+                    "name": "",
+                    "category": "",
+                    "expertType": if team_only { "team" } else { "agent" },
+                    "version": "",
+                }),
             })
             .collect();
     }
@@ -416,7 +504,10 @@ async fn fetch_skills(account: &GrowthAccount) -> Vec<ObjectId> {
     if out.is_empty() {
         out = DEFAULT_SKILL_IDS
             .iter()
-            .map(|(id, name)| ObjectId { id: (*id).to_string(), meta: json!({ "name": name }) })
+            .map(|(id, name)| ObjectId {
+                id: (*id).to_string(),
+                meta: json!({ "name": name }),
+            })
             .collect();
     }
     out
@@ -480,7 +571,11 @@ async fn fetch_lighthouse(account: &GrowthAccount) -> Vec<ObjectId> {
             let blob = format!(
                 "{}{}",
                 item.id.to_lowercase(),
-                item.meta.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase()
+                item.meta
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase()
             );
             let agent = item
                 .meta
@@ -489,7 +584,10 @@ async fn fetch_lighthouse(account: &GrowthAccount) -> Vec<ObjectId> {
                 .unwrap_or("")
                 .to_lowercase();
             let blob = format!("{blob}{agent}");
-            if ["lighthouse", "轻量", "light", "yun"].iter().any(|needle| blob.contains(needle)) {
+            if ["lighthouse", "轻量", "light", "yun"]
+                .iter()
+                .any(|needle| blob.contains(needle))
+            {
                 out.push(item);
             }
         }
@@ -497,8 +595,69 @@ async fn fetch_lighthouse(account: &GrowthAccount) -> Vec<ObjectId> {
     if out.is_empty() {
         out = LIGHTHOUSE_FALLBACK
             .iter()
-            .map(|(id, name)| ObjectId { id: (*id).to_string(), meta: json!({ "name": name }) })
+            .map(|(id, name)| ObjectId {
+                id: (*id).to_string(),
+                meta: json!({ "name": name }),
+            })
             .collect();
+    }
+    out
+}
+
+/// 「无畏契约拼豆专家」（任务 `WorkBuddy_Valorant` 的对象 id 来源）。
+///
+/// 任务原文（实拉 `task_desc`）：「即日起至11月15日，在专家页搜索并召唤
+/// 「无畏契约拼豆专家」，完成一次对话。」→ 需要一个**确定**的专家 id。
+///
+/// 解析顺序：
+/// 1. 专家市场列表按关键词过滤（`fetch_market_experts`，与 lighthouse 同款）；
+/// 2. 回落内置实测值 [`VALORANT_EXPERT`]。
+///
+/// ── 实测修订（2026-10-20 二次验证）────────────────────────────
+/// 第 1 步**现在是活的**：`POST /v2/operation-platform/market/expert/list`
+/// 带 `{page:1,page_size:50,sort_by:"reco_rank",sort_order:"desc",keyword:"拼豆"}`
+/// 返回 4 条，第一条就是 `ex_xQHHD1u5Jkua`（无畏契约拼豆专家 /
+/// `agent_name=valorant-perler-expert`）。早前记录的「排行榜前 100 与 COS 静态
+/// 清单里都没有」依旧成立（那两条是推荐位与静态清单，不是搜索）——
+/// 但不影响市场关键词搜索命中，回落值只在下游抖动时兜底。
+async fn fetch_valorant(account: &GrowthAccount) -> Vec<ObjectId> {
+    let mut out: Vec<ObjectId> = Vec::new();
+    for keyword in ["拼豆", "无畏契约", "valorant-perler"] {
+        for item in fetch_market_experts(account, false, Some(keyword)).await {
+            let blob = format!(
+                "{}{}{}",
+                item.id.to_lowercase(),
+                item.meta
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase(),
+                item.meta
+                    .get("agent_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase()
+            );
+            if ["perler", "拼豆", "valorant", "无畏契约"]
+                .iter()
+                .any(|needle| blob.contains(needle))
+                && !out.iter().any(|existing| existing.id == item.id)
+            {
+                out.push(item);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(ObjectId {
+            id: VALORANT_EXPERT.to_string(),
+            meta: json!({
+                "name": VALORANT_EXPERT_NAME,
+                "category": "",
+                "expertType": "agent",
+                "version": "",
+                "agent_name": "valorant-perler-expert",
+            }),
+        });
     }
     out
 }
@@ -552,4 +711,60 @@ async fn fetch_pe_theme(account: &GrowthAccount) -> Vec<ObjectId> {
         }];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ── 实时打上游：专家市场列表（`#[ignore]`，要真令牌）────────────────
+    /// 这一段钉的是专家市场那条修复：请求体必须带 `sort_by` / `sort_order`
+    /// （缺了上游回 `17101 invalid request body`）、`expert_type=team` 交服务端
+    /// 过滤（实测 22357 → 2340）、关键词走 `keyword`。跑法：
+    /// `WORKBUDDY_TOKEN=… WORKBUDDY_USER_ID=… cargo test -p agent2api-server
+    ///  --lib market_experts_live -- --include-ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn market_experts_live() {
+        let Ok(token) = std::env::var("WORKBUDDY_TOKEN") else {
+            println!("跳过：没有 WORKBUDDY_TOKEN");
+            return;
+        };
+        let account = GrowthAccount {
+            uid: std::env::var("WORKBUDDY_USER_ID").unwrap_or_default(),
+            nick: String::new(),
+            token,
+            domain: std::env::var("WORKBUDDY_DOMAIN")
+                .unwrap_or_else(|_| "www.workbuddy.cn".to_string()),
+            proxy: None,
+        };
+        let all = fetch_market_experts(&account, false, None).await;
+        println!(
+            "全量首 3 页条数 = {}，首个 id = {:?}",
+            all.len(),
+            all.first().map(|item| item.id.as_str())
+        );
+        assert!(!all.is_empty(), "专家市场列表为空（17101 或鉴权失败）");
+        let team = fetch_market_experts(&account, true, None).await;
+        println!(
+            "expert_type=team 条数 = {}，首个 id = {:?}",
+            team.len(),
+            team.first().map(|item| item.id.as_str())
+        );
+        assert!(!team.is_empty(), "团队过滤为空");
+        let keyword = fetch_market_experts(&account, false, Some("拼豆")).await;
+        println!(
+            "keyword=拼豆 条数 = {}，首个 id = {:?}",
+            keyword.len(),
+            keyword.first().map(|item| item.id.as_str())
+        );
+        assert!(!keyword.is_empty(), "关键词检索为空");
+        let valorant = fetch_valorant(&account).await;
+        println!(
+            "fetch_valorant 对象 = {} 个，首个 = {:?}",
+            valorant.len(),
+            valorant.first().map(|item| item.id.as_str())
+        );
+        assert!(!valorant.is_empty(), "无畏契约专家对象为空");
+    }
 }

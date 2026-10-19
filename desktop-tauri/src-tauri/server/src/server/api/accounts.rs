@@ -466,6 +466,21 @@ pub async fn dispatch(
                 return super::growth::travel_run(&state, &id).await;
             }
         }
+        // 新活动（订阅任务 / 徽章墙 / 盲盒 / 抽奖扩展）的两个写动作各自独立端点：
+        // 开盲盒消耗能量 → `/growth/box`；活跃地图分享不改账 → `/growth/share`。
+        // 与上面「单任务执行」同一分寸：一个按钮一条路径，读的时候按界面顺序排。
+        if let Some(id) = rest.strip_suffix("/growth/box") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::box_open(&state, &id, body).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/growth/share") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::share_map(&state, &id, body).await;
+            }
+        }
     }
 
     // ③' GET + /onboarding 结尾 → 新手任务状态（只读，签到后弹窗的查询口）。
@@ -483,6 +498,12 @@ pub async fn dispatch(
         // WorkBuddy 成长任务盘点（只读，见 `api::growth` 的模块头）。
         // 与上面的 onboarding 同一纪律：查询走 GET、动状态走 POST ——
         // 页面展开只查，不给「看一眼就改状态」留机会。
+        if let Some(id) = rest.strip_suffix("/growth/activity") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::growth::extras(&state, &id).await;
+            }
+        }
         if let Some(id) = rest.strip_suffix("/growth") {
             let id = decode_segment(id);
             if !id.is_empty() {

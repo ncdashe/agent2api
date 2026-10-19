@@ -1,12 +1,23 @@
-//! WorkBuddy **成长任务**的管理端点（查询 / 执行 / 开学季 / 猫猫旅行）。
+//! WorkBuddy **成长任务**的管理端点（查询 / 执行 / 开学季 / 猫猫旅行 / 新活动）。
 //!
 //! ```text
 //!   GET  /api/accounts/{id}/growth          任务盘点（只读）：成长任务 + 能量 +
-//!                                           旅行状态 + 开学季概况
+//!                                           旅行状态 + 开学季概况 + 订阅任务 /
+//!                                           徽章 / 成长档案 / 盲盒配额 + 未登记任务
+//!   GET  /api/accounts/{id}/growth/activity 新活动只读盘点（徽章墙 / 抽奖奖池与流水 /
+//!                                           兑换汇总 / 猫猫图鉴与模板 / 活跃地图）
 //!   POST /api/accounts/{id}/growth/task     执行**单个**任务 { code, mode: full|claim }
 //!   POST /api/accounts/{id}/growth/school   开学季任务 + 可选抽奖 { only?, lottery? }
 //!   POST /api/accounts/{id}/growth/travel   猫猫旅行巡检一次
+//!   POST /api/accounts/{id}/growth/box      开盲盒 { count }（消耗能量，写动作）
+//!   POST /api/accounts/{id}/growth/share    活跃地图分享（写动作）
 //! ```
+//!
+//! ── 新活动（订阅任务 / 徽章墙 / 盲盒 / 抽奖扩展）怎么进来的 ──
+//! 端点清单逐条抄自线上前端产物 `growthSpace-Bhoa8Yzh.js`（成长中心的 API 层），
+//! 执行体在 `core::providers::workbuddy::growth::activity`。写法沿用本文件的
+//! 老纪律：**查询走 GET、动状态走 POST**，两者不合并 —— 页面展开只查，
+//! 按钮才是写；响应里读不出的量给 `null`（界面上显示「未读数」），不给 0。
 //!
 //! ── 这是什么 ────────────────────────────────────────────────
 //! 从参考项目 workbuddy2api 的 scripts/task_runner.py 与 school_open_day_2026.py
@@ -39,18 +50,20 @@ use axum::body::Bytes;
 use axum::response::Response;
 
 use crate::server::core::providers::workbuddy::growth::{
-    self, school, spec, travel, GrowthAccount, TaskOutcome,
+    self, activity, school, spec, travel, GrowthAccount, TaskOutcome,
 };
 use crate::server::errors::management_error;
 use crate::server::http::ok_json;
 use crate::server::ServerState;
 
-/// 解析请求体里的 `{ code, mode, only, lottery }`（缺省 / 非 JSON 都给默认值）。
+/// 解析请求体里的 `{ code, mode, only, lottery, count }`（缺省 / 非 JSON 都给默认值）。
 struct GrowthRequest {
     code: String,
     mode: String,
     only: Vec<String>,
     lottery: bool,
+    /// 开盲盒次数（`POST /growth/box`；缺省 1，执行体再夹到 1..=MAX_BOX_OPEN）
+    count: i64,
 }
 
 fn parse_request(body: &Bytes) -> GrowthRequest {
@@ -77,7 +90,8 @@ fn parse_request(body: &Bytes) -> GrowthRequest {
         })
         .unwrap_or_default();
     let lottery = payload.get("lottery").and_then(Value::as_bool).unwrap_or(false);
-    GrowthRequest { code, mode, only, lottery }
+    let count = payload.get("count").and_then(Value::as_i64).unwrap_or(1);
+    GrowthRequest { code, mode, only, lottery, count }
 }
 
 /// 取账号记录（找不到报 404）。
@@ -133,13 +147,27 @@ fn task_row(task: &Value) -> Value {
 
 /// `GET /api/accounts/{id}/growth` —— 任务盘点（只读，不发任何写请求）。
 ///
-/// 返回四块：成长任务清单（含每任务的展示与支持标记）、能量/连登读数、
-/// 猫猫旅行状态、开学季概况（含抽奖余额）。各块相互独立：某一块拉取失败
-/// 只在该块给 `error` 字段，不影响其余（用户要看到「哪块坏了」）。
+/// 返回的块：成长任务清单（含每任务的展示与支持标记）、**未登记任务**（新活动
+/// 发现口）、能量/连登读数、猫猫旅行状态、开学季概况（含抽奖余额）、
+/// **订阅任务状态 / 徽章墙 / 成长档案 / 盲盒配额**（后四块是活动新机制）。
+/// 各块相互独立：某一块拉取失败只在该块给 `error` 字段，不影响其余（用户要
+/// 看到「哪块坏了」，而不是整页空白）。
+///
+/// 顺序上先刷 `subscribe-task/status` 再拉任务列表 —— 与线上前端一致（订阅类
+/// 任务靠这一刷才下发）；这一刷失败不阻塞列表。
 pub async fn status(state: &ServerState, account_id: &str) -> Response {
     let account = match growth_account(state, account_id) {
         Ok(account) => account,
         Err(response) => return response,
+    };
+
+    // ── 订阅任务状态（**先刷一次**，再拉任务列表）──
+    // 线上前端的固定顺序是 `subscribe-task/status` → `tasks`：订阅类任务靠这
+    // 一刷解锁（没刷时列表里不下发）。它的失败**不阻塞**任务列表 —— 与前端
+    // `.catch()` 之后照拉列表同分寸；错误只写进本块，界面据此提示。
+    let subscribe_block = match activity::subscribe_status(&account).await {
+        Ok(data) => json!({ "data": data, "error": Value::Null }),
+        Err(error) => json!({ "data": Value::Null, "error": error }),
     };
 
     // ── 成长任务清单 ──
@@ -175,6 +203,63 @@ pub async fn status(state: &ServerState, account_id: &str) -> Response {
     // ── 能量 / 连登读数（只读 oracle，失败给 null）──
     let energy = growth::energy_balance(&account).await;
     let streak = growth::growth_streak(&account).await;
+
+    // ── 未登记任务（新活动的发现口）──
+    // 上游会不定期加任务码（活动规则原文：「活动方将不定期增加新任务及对应的
+    // 奖励」）。映射表没登记的任务一律保守跳过，但**不能让用户看不见** ——
+    // 这里把它们单独聚成一块，界面可以显示「发现 N 个新任务，待登记」。
+    let unknown_tasks = tasks_block
+        .get("tasks")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.get("supported").and_then(Value::as_bool) != Some(true))
+                .map(|row| {
+                    json!({
+                        "code": row.get("code").cloned().unwrap_or(Value::Null),
+                        "title": row.get("title").cloned().unwrap_or(Value::Null),
+                        "description": row.get("description").cloned().unwrap_or(Value::Null),
+                        "status": row.get("status").cloned().unwrap_or(Value::Null),
+                        "current": row.get("current").cloned().unwrap_or(Value::Null),
+                        "target": row.get("target").cloned().unwrap_or(Value::Null),
+                        "locked": row.get("locked").cloned().unwrap_or(Value::Null),
+                        "unlockAt": row.get("unlockAt").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<Value>>()
+        })
+        .unwrap_or_default();
+
+    // ── 徽章墙 / 成长档案 / 盲盒配额（只读；各块独立失败）──
+    let badges_block = match activity::badge_summary(&account).await {
+        Ok(summary) => json!({
+            "total": summary.total,
+            "earned": summary.earned,
+            "data": summary.raw,
+            "error": Value::Null,
+        }),
+        Err(error) => json!({ "total": Value::Null, "earned": Value::Null, "data": Value::Null, "error": error }),
+    };
+    let profile_block = match activity::profile(&account).await {
+        Ok(data) => json!({ "data": data, "error": Value::Null }),
+        Err(error) => json!({ "data": Value::Null, "error": error }),
+    };
+    let box_block = match activity::box_quota_summary(&account).await {
+        Ok(quota) => json!({
+            "energy": quota.energy,
+            "costPerOpen": quota.cost_per_open,
+            "opens": quota.opens,
+            "data": quota.raw,
+            "error": Value::Null,
+        }),
+        Err(error) => json!({
+            "energy": Value::Null,
+            "costPerOpen": Value::Null,
+            "opens": Value::Null,
+            "data": Value::Null,
+            "error": error,
+        }),
+    };
 
     // ── 猫猫旅行状态 ──
     let travel_block = match travel::buddy_info(&account).await {
@@ -250,6 +335,11 @@ pub async fn status(state: &ServerState, account_id: &str) -> Response {
         "tasks": tasks_block,
         "travel": travel_block,
         "school": school_block,
+        "subscribe": subscribe_block,
+        "profile": profile_block,
+        "badges": badges_block,
+        "box": box_block,
+        "unknownTasks": unknown_tasks,
     }))
 }
 
@@ -378,3 +468,136 @@ pub async fn travel_run(state: &ServerState, account_id: &str) -> Response {
         "credit": report.credit,
     }))
 }
+
+/// `GET /api/accounts/{id}/growth/activity` —— 新活动只读盘点。
+///
+/// 覆盖「任务树之外」的活动面（端点清单抄自线上前端 `growthSpace-Bhoa8Yzh.js`）：
+/// 徽章墙、抽奖（汇总 / 奖池 / 次数 / 次数流水 / 抽奖记录 / 中奖记录）、
+/// 兑换汇总、猫猫图鉴与模板、活跃地图。**全是只读**，一个写动作都不带 ——
+/// 写动作各自有独立端点（box / share / task），免得「点一下看全部」变成改状态。
+///
+/// 各块相互独立：某块拉取失败只在该块给 `error`，不影响其余（与 `status` 同纪律）。
+pub async fn extras(state: &ServerState, account_id: &str) -> Response {
+    let account = match growth_account(state, account_id) {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let page_size = activity::DEFAULT_PAGE_SIZE;
+
+    /// 只读块封装：成功给 `{data,error:null}`，失败给 `{data:null,error}`。
+    fn block(result: Result<Value, String>) -> Value {
+        match result {
+            Ok(data) => json!({ "data": data, "error": Value::Null }),
+            Err(error) => json!({ "data": Value::Null, "error": error }),
+        }
+    }
+
+    let badges = match activity::badge_summary(&account).await {
+        Ok(summary) => json!({
+            "total": summary.total,
+            "earned": summary.earned,
+            "data": summary.raw,
+            "error": Value::Null,
+        }),
+        Err(error) => json!({
+            "total": Value::Null,
+            "earned": Value::Null,
+            "data": Value::Null,
+            "error": error,
+        }),
+    };
+    let quota = match activity::box_quota_summary(&account).await {
+        Ok(summary) => json!({
+            "energy": summary.energy,
+            "costPerOpen": summary.cost_per_open,
+            "opens": summary.opens,
+            "data": summary.raw,
+            "error": Value::Null,
+        }),
+        Err(error) => json!({
+            "energy": Value::Null,
+            "costPerOpen": Value::Null,
+            "opens": Value::Null,
+            "data": Value::Null,
+            "error": error,
+        }),
+    };
+
+    // 逐块 await 成局部量再拼 json!（不在宏参数里 await：可读性 + 诊断友好）。
+    let profile_block = block(activity::profile(&account).await);
+    let box_list = block(activity::box_list(&account).await);
+    let box_templates = block(activity::box_templates(&account).await);
+    let box_visible = block(activity::box_visible(&account).await);
+    let heatmap = block(activity::heatmap(&account).await);
+    let redeem = block(activity::redeem_summary(&account).await);
+    let lottery_summary = block(activity::lottery_summary(&account).await);
+    let lottery_prizes = block(activity::lottery_prizes(&account).await);
+    let lottery_chances = block(activity::lottery_chances(&account).await);
+    let lottery_chances_logs = block(activity::lottery_chances_logs(&account, 1, page_size).await);
+    let lottery_draws = block(activity::lottery_draws(&account, 1, page_size).await);
+    let lottery_rewards = block(activity::lottery_rewards(&account, 1, page_size).await);
+
+    ok_json(json!({
+        "id": account_id,
+        "profile": profile_block,
+        "badges": badges,
+        "box": {
+            "quota": quota,
+            "list": box_list,
+            "templates": box_templates,
+            "visible": box_visible,
+        },
+        "heatmap": heatmap,
+        "redeem": redeem,
+        "lottery": {
+            "summary": lottery_summary,
+            "prizes": lottery_prizes,
+            "chances": lottery_chances,
+            "chancesLogs": lottery_chances_logs,
+            "draws": lottery_draws,
+            "rewards": lottery_rewards,
+        },
+    }))
+}
+
+/// `POST /api/accounts/{id}/growth/box` —— 开盲盒（写动作，消耗能量）。
+///
+/// body `{count}`：缺省 1；执行体把次数夹在 `1..=MAX_BOX_OPEN`（`activity.rs`）。
+/// 上游每次开启消耗固定能量值（页面文案：「每次开启盲盒需要消耗 N 能量值」），
+/// 所以本端点**不自动判断够不够**：能量不足由上游报错，如实回给界面（错误文案
+/// 里带 HTTP 与 business code），不做「先扣后补」这类自作聪明的事。
+pub async fn box_open(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
+    let account = match growth_account(state, account_id) {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let request = parse_request(body);
+    let count = if request.count <= 0 { 1 } else { request.count };
+    match activity::box_open(&account, count).await {
+        Ok(data) => ok_json(json!({
+            "id": account_id,
+            "count": count.min(activity::MAX_BOX_OPEN),
+            "outcome": "done",
+            "data": data,
+        })),
+        Err(error) => management_error(502, error),
+    }
+}
+
+/// `POST /api/accounts/{id}/growth/share` —— 活跃地图分享（写动作）。
+///
+/// 线上前端 `heatmap/share` 的可选 body 是 `t ?? {}`；这里同形：无 body 发空对象。
+/// 分享是幂等的展示动作（不改积分与能量），所以不需要「先查再写」的前置流程。
+pub async fn share_map(state: &ServerState, account_id: &str, body: &Bytes) -> Response {
+    let account = match growth_account(state, account_id) {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let body_ref = if payload.is_object() { Some(&payload) } else { None };
+    match activity::heatmap_share(&account, body_ref).await {
+        Ok(data) => ok_json(json!({ "id": account_id, "outcome": "done", "data": data })),
+        Err(error) => management_error(502, error),
+    }
+}
+

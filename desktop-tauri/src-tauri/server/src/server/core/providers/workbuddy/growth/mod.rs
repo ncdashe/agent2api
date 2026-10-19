@@ -36,10 +36,13 @@
 //!   school.rs         开学季活动域（任务 + 幸运转盘）
 //!   travel.rs         猫猫旅行状态机（buddy info / status / depart / claim）
 //!   streak.rs         连登管家（补签 → 档位兑换 → 抽奖闭环）
+//!   activity.rs       新活动周边机制：订阅任务解锁口 / 徽章墙 / 成长档案 /
+//!                     盲盒（开·换·配额·图鉴）/ 活跃地图分享 / 抽奖扩展 / 兑换汇总
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本目录零 unwrap/expect/panic。
 
+pub mod activity;
 pub mod events;
 pub mod school;
 pub mod spec;
