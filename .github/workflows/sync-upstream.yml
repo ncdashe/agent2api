@@ -1,0 +1,99 @@
+name: sync-upstream
+
+# 每天自动把上游（Agent2API/agent2api）合进 fork 的 beta 分支。
+#
+# ── 为什么要有它 ─────────────────────────────────────────────
+# 这个仓库是 fork：日常改动落在 beta，上游的更新也要跟进来。手工同步一次
+# 要开电脑、拉代码、解冲突，久了就不做了。这个工作流把「拉 + 合 + 自检」
+# 自动化，电脑关着也照跑。
+#
+# ── 冲突时的行为（重要）─────────────────────────────────────
+# `git merge` 一旦冲突，job 直接失败，**不 push、不留半成品**：beta 保持
+# 同步前的样子，GitHub 会给仓库发失败通知。冲突文件清单打在 job summary 里，
+# 手工（或找 AI）解决后再手动跑一次本工作流或本地 `同步上游.cmd`。
+# 也就是说：自动的是「没冲突的 90%」，冲突永远要人过一眼 —— 这是 git 的
+# 边界，不是偷懒。
+#
+# ── 为什么会带一次 cargo check ──────────────────────────────
+# 上游改的可能是我们这几个月改过的同一批文件（成长任务、账号导入）。
+# 文本层面能自动合并、语义上却编不过的情况真实存在，所以合并后立刻
+# `cargo check -p agent2api-server`：编不过就把这一步炸红，beta 上留下的
+# 合并提交由人工决定是修还是回滚。
+#
+# ── 权限与触发 ──────────────────────────────────────────────
+# contents: write —— 用仓库自带的 GITHUB_TOKEN push 回 beta；这样推的分支
+# **不会**再触发 build.yml / docker.yml（那两个只认 workflow_dispatch 与
+# v* tag），不担心构建风暴。
+# 时刻：UTC 20:30 = 北京时间 04:30。
+
+on:
+  schedule:
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 beta
+        uses: actions/checkout@v7
+        with:
+          ref: beta
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 接入上游并比较
+        id: check
+        run: |
+          git remote add upstream https://github.com/Agent2API/agent2api.git
+          git fetch upstream --no-tags --prune
+          behind="$(git rev-list --count HEAD..upstream/main)"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "beta 落后上游 $behind 个提交"
+          if [ "$behind" != "0" ]; then
+            git --no-pager log --oneline -15 HEAD..upstream/main
+          fi
+
+      - name: 合并上游 main
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-ff --no-edit upstream/main
+
+      - name: 安装 Rust
+        if: steps.check.outputs.behind != '0'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 编译自检（网关 crate）
+        if: steps.check.outputs.behind != '0'
+        run: |
+          cd desktop-tauri/src-tauri
+          cargo check -p agent2api-server
+
+      - name: 推送 beta
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git push origin beta
+          echo "已把上游合并进 beta 并推送" >> "$GITHUB_STEP_SUMMARY"
+          git --no-pager log --oneline -5 >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 冲突/失败清单
+        if: failure()
+        run: |
+          {
+            echo "## 同步失败，beta 未改动"
+            echo ""
+            echo "### 冲突文件"
+            git diff --name-only --diff-filter=U || true
+            echo ""
+            echo "### 未合并的路径"
+            git status --porcelain || true
+          } >> "$GITHUB_STEP_SUMMARY"
