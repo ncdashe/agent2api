@@ -1,35 +1,47 @@
 name: sync-upstream
 
-# 每天自动把上游（Agent2API/agent2api）合进 fork 的 beta 分支。
+# 每天自动把上游合进 fork 的 beta 分支。上游不可达时**安静跳过**，不报红。
 #
-# ── 为什么要有它 ─────────────────────────────────────────────
-# 这个仓库是 fork：日常改动落在 beta，上游的更新也要跟进来。手工同步一次
-# 要开电脑、拉代码、解冲突，久了就不做了。这个工作流把「拉 + 合 + 自检」
-# 自动化，电脑关着也照跑。
+# ── 上游是谁：三级解析 ──────────────────────────────────────
+# ① 手动触发时填的 repo 入参
+# ② 仓库变量 UPSTREAM_REPO（Settings → Variables）
+# ③ 自动读本仓库的 fork 关系：`/repos/<me>` 的 parent.full_name
+# 上游改名换址也能跟上（parent 会跟着变），不用改文件。
 #
-# ── 冲突时的行为（重要）─────────────────────────────────────
-# `git merge` 一旦冲突，job 直接失败，**不 push、不留半成品**：beta 保持
-# 同步前的样子，GitHub 会给仓库发失败通知。冲突文件清单打在 job summary 里，
-# 手工（或找 AI）解决后再手动跑一次本工作流或本地 `同步上游.cmd`。
-# 也就是说：自动的是「没冲突的 90%」，冲突永远要人过一眼 —— 这是 git 的
-# 边界，不是偷懒。
+# ── 上游不可达就跳过（2026-10-20 实况）─────────────────────
+# 上游 `Agent2API/agent2api` 在 2026-10-20T03:57Z 前后转为不可访问（API 404，
+# fork 的 parent 仍指向 `Agent2API/Agent2API`）。这类情况（私有化 / 删除 /
+# 改名失败 / 网络抖动）不该每天发一封失败邮件，所以先探测再干活：
+#   探测失败 → 写一条 summary → 本 job **成功**退出，beta 一个字节不动。
+# 上游恢复公开、或你配了能读私有的 UPSTREAM_TOKEN，下一次定时跑就会自动接上。
 #
-# ── 为什么会带一次 cargo check ──────────────────────────────
-# 上游改的可能是我们这几个月改过的同一批文件（成长任务、账号导入）。
-# 文本层面能自动合并、语义上却编不过的情况真实存在，所以合并后立刻
-# `cargo check -p agent2api-server`：编不过就把这一步炸红，beta 上留下的
-# 合并提交由人工决定是修还是回滚。
+# ── 私有上游怎么接 ──────────────────────────────────────────
+# Settings → Secrets → 新建 `UPSTREAM_TOKEN`（对上游有 read 权限的 PAT）。
+# 配了它就用 insteadOf 把 https://github.com/ 改写成带令牌的地址，只在本次
+# job 内生效，日志里会被 mask。
 #
-# ── 权限与触发 ──────────────────────────────────────────────
-# contents: write —— 用仓库自带的 GITHUB_TOKEN push 回 beta；这样推的分支
-# **不会**再触发 build.yml / docker.yml（那两个只认 workflow_dispatch 与
-# v* tag），不担心构建风暴。
-# 时刻：UTC 20:30 = 北京时间 04:30。
+# ── 冲突时的行为 ────────────────────────────────────────────
+# `git merge` 冲突 → job 失败、**不 push**、beta 保持同步前的样子，冲突文件
+# 清单写进 job summary。2026-10-20 那次实测：上游的提交与我这边撞了 4 个
+# 文件，其中 `server/Cargo.toml`、`growth/mod.rs` 内容冲突，`api/accounts.rs`、
+# `account_store/mod.rs` 能自动合并 —— 冲突永远要人过一眼，这是 git 的边界。
+#
+# ── 合并后为什么要 cargo check ──────────────────────────────
+# 文本能合、语义编不过的情况真实存在。编不过就炸红，beta 上那个合并提交
+# 由人工决定修还是回滚，绝不把编不过的代码推上去。
+#
+# 时刻：UTC 20:30 = 北京 04:30。push 用仓库自带 GITHUB_TOKEN，不会触发
+# build.yml / docker.yml（那两个只认 workflow_dispatch 与 v* tag）。
 
 on:
   schedule:
     - cron: '30 20 * * *'
   workflow_dispatch:
+    inputs:
+      repo:
+        description: '上游 owner/name，留空则自动解析'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -41,6 +53,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
     steps:
       - name: 检出 beta
         uses: actions/checkout@v7
@@ -49,10 +63,56 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 解析上游仓库
+        id: upstream
+        run: |
+          repo="${{ github.event.inputs.repo }}"
+          if [ -z "$repo" ]; then
+            repo="${{ vars.UPSTREAM_REPO }}"
+          fi
+          if [ -z "$repo" ]; then
+            repo="$(curl -fsSL \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${{ github.api_url }}/repos/${{ github.repository }}" \
+              | jq -r '.parent.full_name // .source.full_name // empty')"
+          fi
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "上游仓库：${repo:-<未识别>}"
+
+      - name: 探测上游可达性
+        id: probe
+        run: |
+          repo="${{ steps.upstream.outputs.repo }}"
+          if [ -z "$repo" ]; then
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "### 没能解析出上游仓库，本次跳过" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -n "$UPSTREAM_TOKEN" ]; then
+            git config --global \
+              url."https://x-access-token:${UPSTREAM_TOKEN}@github.com/".insteadOf \
+              "https://github.com/"
+          fi
+          if git ls-remote --heads "https://github.com/${repo}.git" >/dev/null 2>&1; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### 上游不可访问，本次跳过（不是失败）"
+              echo ""
+              echo "- 上游：\`${repo}\`"
+              echo "- beta 未做任何改动"
+              echo "- 上游恢复公开后，下一次定时跑会自动接上"
+              echo "- 上游若是私有：配 secret \`UPSTREAM_TOKEN\`（对上游有 read 权限）"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: 接入上游并比较
+        if: steps.probe.outputs.reachable == 'true'
         id: check
         run: |
-          git remote add upstream https://github.com/Agent2API/agent2api.git
+          git remote add upstream "https://github.com/${{ steps.upstream.outputs.repo }}.git"
           git fetch upstream --no-tags --prune
           behind="$(git rev-list --count HEAD..upstream/main)"
           echo "behind=$behind" >> "$GITHUB_OUTPUT"
@@ -62,28 +122,31 @@ jobs:
           fi
 
       - name: 合并上游 main
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.behind != '0' && steps.check.outputs.behind != ''
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git merge --no-ff --no-edit upstream/main
 
       - name: 安装 Rust
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.behind != '0' && steps.check.outputs.behind != ''
         uses: dtolnay/rust-toolchain@stable
 
       - name: 编译自检（网关 crate）
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.behind != '0' && steps.check.outputs.behind != ''
         run: |
           cd desktop-tauri/src-tauri
           cargo check -p agent2api-server
 
       - name: 推送 beta
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.behind != '0' && steps.check.outputs.behind != ''
         run: |
           git push origin beta
-          echo "已把上游合并进 beta 并推送" >> "$GITHUB_STEP_SUMMARY"
-          git --no-pager log --oneline -5 >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### 已把上游合并进 beta"
+            echo ""
+            git --no-pager log --oneline -5
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 冲突/失败清单
         if: failure()
@@ -94,6 +157,6 @@ jobs:
             echo "### 冲突文件"
             git diff --name-only --diff-filter=U || true
             echo ""
-            echo "### 未合并的路径"
+            echo "### 工作区状态"
             git status --porcelain || true
           } >> "$GITHUB_STEP_SUMMARY"
