@@ -1,0 +1,64 @@
+name: linux-bundle
+
+# 只做一件事：把网关的 Linux amd64 运行包打出来挂成 workflow artifact。
+#
+# 为什么单独一个工作流：
+#   build.yml 一次会跑 5 个 job（macos / windows / linux-desktop / linux-server /
+#   windows-server），只为了拿 Linux 服务端包却要等 macOS 和 Windows 的 runner，
+#   还白烧 macOS 分钟数。这里只留 linux-server 的 amd64 一档。
+#
+# 产物（agent2api-server-linux-amd64.tar.gz）根下两个条目：
+#   agent2api-server   网关可执行文件
+#   ui/                面板静态文件
+# 这两个名字是容器内更新链的硬约定（selfupdate::extract_bundle 按名取），
+# 也是「目标服务器连不上 github.com 时」的离线搬运单元：
+#   在服务器上 docker build 一个只有 FROM + COPY 的 Dockerfile，
+#   基础镜像用正在跑的那个 —— 全程不需要外网。
+#
+# 触发：Actions 页面手动 Run workflow，或用 API：
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 设置 buildx
+        uses: docker/setup-buildx-action@v4
+
+      # 不加 cache-from/cache-to：裸 buildx 用 gha 缓存需要额外环境，
+      # 缓存 miss 的代价是有可能直接报错。冷编译一次二十分钟，不值得冒险。
+      - name: 构建 bundle 阶段
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --target bundle \
+            --output type=local,dest=out \
+            .
+          ls -lh out/bundle
+          file out/bundle/agent2api-server || true
+
+      - name: 打包并生成校验和
+        run: |
+          name="agent2api-server-linux-amd64.tar.gz"
+          mkdir -p dist
+          tar -C out/bundle -czf "dist/$name" agent2api-server ui
+          ( cd dist && sha256sum "$name" > "$name.sha256" )
+          cat "dist/$name.sha256"
+          ls -lh dist
+          echo "── 包内条目 ──"
+          tar -tzf "dist/$name" | head -20
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-bundle-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
