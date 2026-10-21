@@ -61,6 +61,32 @@ const BENEFIT_ABSENT_CODE: &str = "4004";
 /// 避免 4004 将来承载别的语义时被误判成「无福利」而掩盖真错误）。
 const BENEFIT_ABSENT_MARKER: &str = "benefit not found";
 
+/// 福利网关的第二条「该账号没有福利数据」业务码：**有档案、但没进任何福利组**。
+///
+/// 实测（2026-10-21，套餐 Trial 账号）：GET 同一端点回 HTTP 200 +
+/// `{"error_code":"4000","error_msg":"invalid channel, group not found"}`。
+/// 福利池是按 `channel` + `group` 分组的，没被活动拉进组的账号就是这个码 ——
+/// 与 4004 是同一件事的两种措辞（4004 = 连 benefit 档案都没有；
+/// 4000 + group not found = 档案在，组里没有它）。两者都属于「这个账号
+/// 眼下没有福利池」的正常状态，不是查询失败。
+///
+/// 翻成 `Ok(None)` 的收益是双份的：界面不再渲染成「福利网关未读到」的警告，
+/// 而且 `query_usage` 里那条「无档案就补一次 claim 再重查」的自愈链会照常
+/// 触发 —— 补 claim 说不定就把账号拉进组了，拉进去了福利就真出现了。
+const BENEFIT_ABSENT_GROUP_CODE: &str = "4000";
+/// 同一条的文案兜底（理由同 `BENEFIT_ABSENT_MARKER`）。
+const BENEFIT_ABSENT_GROUP_MARKER: &str = "group not found";
+
+/// 上游这一条 envelope 算不算「该账号没有福利数据」。
+///
+/// 每一种都必须**码与文案双双命中**：只认码的话，上游让某个码承载新语义时会被
+/// 静默吞成「无福利」；只认文案的话，换码就失效。两条负向单测各自钉住一半。
+fn is_benefit_absent(code: &str, message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    (code == BENEFIT_ABSENT_CODE && lowered.contains(BENEFIT_ABSENT_MARKER))
+        || (code == BENEFIT_ABSENT_GROUP_CODE && lowered.contains(BENEFIT_ABSENT_GROUP_MARKER))
+}
+
 /// 一个计量表。`credit_*` 三项是「套餐赠送积分」口径，`used/allowance_tokens`
 /// 是 token 口径 —— 上游按指标类型给其中一组，另一组留空。
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -424,7 +450,8 @@ pub fn parse_benefit_claim(body: &str, credential: &Credential) -> Result<String
 /// 福利网关的解析：**成功看 envelope，不看 HTTP 状态**。
 ///
 /// 三种结局：`Ok(Some)` 读到福利；`Ok(None)` 上游明说没有该账号的福利数据
-/// （`4004 benefit not found`，正常状态）；`Err` 才是真失败。
+/// （`4004 benefit not found` 或 `4000 invalid channel, group not found`，正常状态）；
+/// `Err` 才是真失败。
 pub fn parse_benefit_balance(body: &str, credential: &Credential) -> Result<Option<BenefitBalance>, GatewayError> {
     let parsed: Value = serde_json::from_str(body)
         .map_err(|error| GatewayError::with_status(502, format!("CodeArts 福利余额响应不是合法 JSON：{error}")))?;
@@ -433,9 +460,9 @@ pub fn parse_benefit_balance(body: &str, credential: &Credential) -> Result<Opti
         let message = parsed.get("error_msg").and_then(Value::as_str).unwrap_or("");
         // 「没有福利数据」与「查询失败」是两回事：前者是账号的正常状态
         // （福利按活动下发，Free 账号常常没有），后者才该冒到界面当警告。
-        // 码与文案**都**命中才算 —— 只认码的话，4004 将来承载别的语义时
-        // 会被静默吞成「无福利」；只认文案的话，换码就失效。
-        if code == BENEFIT_ABSENT_CODE && message.to_lowercase().contains(BENEFIT_ABSENT_MARKER) {
+        // 判据集中在 `is_benefit_absent`：4004 + benefit not found（连档案都没有）
+        // 与 4000 + group not found（档案在、没被活动拉进组）都算「没有福利」。
+        if is_benefit_absent(code, message) {
             return Ok(None);
         }
         return Err(GatewayError::with_status(
@@ -829,6 +856,31 @@ mod tests {
         let other_message = r#"{"error_code":"4004","error_msg":"something else"}"#;
         assert!(parse_benefit_balance(other_message, &credential()).is_err(), "4004 配别的文案要如实报错");
         let other_code = r#"{"error_code":"4005","error_msg":"benefit not found"}"#;
+        assert!(parse_benefit_balance(other_code, &credential()).is_err(), "别的码配同一文案也要如实报错");
+    }
+
+    /// 第二种「没有福利」：**档案在、但没被活动拉进组**（实测 2026-10-21，
+    /// 套餐 Trial 账号）。上游回 `4000 invalid channel, group not found`。
+    ///
+    /// 它此前被当成查询失败，界面上表现为余额格子的警告「福利网关未读到：
+    /// CodeArts 福利余额返回 4000: invalid channel, group not found」——
+    /// 用户会去查一个不存在的问题。翻成 `Ok(None)` 之后界面显示中性的
+    /// 「无福利额度」，同时 `query_usage` 的自愈链会补一次 claim 再重查。
+    #[test]
+    fn a_benefit_without_a_group_is_an_absence_not_a_failure() {
+        let absent = r#"{"error_code":"4000","error_msg":"invalid channel, group not found"}"#;
+        assert!(
+            matches!(parse_benefit_balance(absent, &credential()), Ok(None)),
+            "4000 + group not found 是「没进福利组」，不是失败"
+        );
+        // 大小写不敏感（上游文案换过大小写口径）
+        let upper = r#"{"error_code":"4000","error_msg":"Invalid channel, GROUP NOT FOUND"}"#;
+        assert!(matches!(parse_benefit_balance(upper, &credential()), Ok(None)), "文案比对不分大小写");
+
+        // 码与文案仍要双双命中：4000 配别的文案、别的码配 group not found 都要如实报错。
+        let other_message = r#"{"error_code":"4000","error_msg":"invalid signature"}"#;
+        assert!(parse_benefit_balance(other_message, &credential()).is_err(), "4000 配别的文案要如实报错");
+        let other_code = r#"{"error_code":"4001","error_msg":"group not found"}"#;
         assert!(parse_benefit_balance(other_code, &credential()).is_err(), "别的码配同一文案也要如实报错");
     }
 
